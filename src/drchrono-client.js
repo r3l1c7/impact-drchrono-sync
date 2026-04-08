@@ -119,45 +119,94 @@ function formatDOB(impactDOB) {
 }
 
 /**
+ * Check whether two first names are compatible:
+ * exact match, or one is a prefix of the other (e.g. "Santa" / "Santagiselle").
+ */
+function firstNameCompatible(impactName, drchronoName) {
+  const a = (impactName || '').trim().toUpperCase();
+  const b = (drchronoName || '').trim().toUpperCase();
+  if (!a || !b) return false;
+  return a === b || a.startsWith(b) || b.startsWith(a);
+}
+
+/**
  * Search for a patient in DrChrono by name and DOB.
- * Returns the first matching patient object, or null.
+ *
+ * Strategy:
+ *   1. Exact match: first_name + last_name + DOB
+ *   2. Fallback:    last_name + DOB only
+ *      - Accept if exactly 1 result AND first name is a prefix match
+ *      - Skip if 0 results, 2+ results, or name doesn't partially match
+ *
+ * Returns the matching patient object, or null.
  */
 export async function findPatient(firstName, lastName, dob) {
-  const params = {
-    first_name: firstName,
-    last_name: lastName,
-  };
-
   const formattedDOB = formatDOB(dob);
-  if (formattedDOB) {
-    params.date_of_birth = formattedDOB;
-  }
+
+  // ── Pass 1: exact first + last + DOB ──
+  const exactParams = { first_name: firstName, last_name: lastName };
+  if (formattedDOB) exactParams.date_of_birth = formattedDOB;
 
   logger.debug('Searching DrChrono for patient', { lastName, dob: formattedDOB });
 
-  const response = await drchronoRequest({
+  const exactResp = await drchronoRequest({
     method: 'GET',
     url: '/api/patients',
-    params,
+    params: exactParams,
   });
 
-  const patients = response.data.results || [];
+  const exactResults = exactResp.data.results || [];
 
-  if (patients.length === 0) {
+  if (exactResults.length === 1) {
+    const patient = exactResults[0];
+    logger.info(`Found patient ID: ${patient.id}`);
+    logger.debug(`Patient match: ${patient.first_name} ${patient.last_name}`);
+    return patient;
+  }
+
+  if (exactResults.length > 1) {
+    logger.warn(`Multiple patients matched — using first (ID: ${exactResults[0].id})`);
+    logger.debug(`Multi-match for: ${firstName} ${lastName}`);
+    return exactResults[0];
+  }
+
+  // ── Pass 2: fallback to last_name + DOB only ──
+  if (!formattedDOB) {
     logger.warn(`No patient found in DrChrono for given name/DOB`);
     logger.debug(`Unmatched patient: ${firstName} ${lastName} (DOB: ${dob})`);
     return null;
   }
 
-  if (patients.length > 1) {
-    logger.warn(`Multiple patients matched — using first (ID: ${patients[0].id})`);
-    logger.debug(`Multi-match for: ${firstName} ${lastName}`);
+  logger.debug('Exact match failed, trying last_name + DOB fallback');
+
+  const fallbackResp = await drchronoRequest({
+    method: 'GET',
+    url: '/api/patients',
+    params: { last_name: lastName, date_of_birth: formattedDOB },
+  });
+
+  const fallbackResults = fallbackResp.data.results || [];
+
+  if (fallbackResults.length === 0) {
+    logger.warn(`No patient found in DrChrono for given name/DOB`);
+    logger.debug(`Unmatched patient: ${firstName} ${lastName} (DOB: ${dob})`);
+    return null;
   }
 
-  const patient = patients[0];
-  logger.info(`Found patient ID: ${patient.id}`);
-  logger.debug(`Patient match: ${patient.first_name} ${patient.last_name}`);
-  return patient;
+  if (fallbackResults.length > 1) {
+    logger.warn(`Fuzzy search returned ${fallbackResults.length} patients for same last name + DOB — skipping (ambiguous)`);
+    return null;
+  }
+
+  const candidate = fallbackResults[0];
+
+  if (!firstNameCompatible(firstName, candidate.first_name)) {
+    logger.warn(`Fuzzy match rejected: first names not compatible ("${firstName}" vs "${candidate.first_name}")`);
+    return null;
+  }
+
+  logger.info(`Found patient ID: ${candidate.id} (fuzzy match: "${candidate.first_name}" ≈ "${firstName}")`);
+  return candidate;
 }
 
 // ─── Document Upload ───────────────────────────────────────────
