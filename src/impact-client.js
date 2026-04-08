@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import axios from 'axios';
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import logger from './logger.js';
 
 // ═══════════════════════════════════════════════════════════════
@@ -163,4 +164,63 @@ export async function fetchReportNorms(testID, recordTypeIdentifier) {
   }
 
   return norms;
+}
+
+// ─── PDF Overlay ────────────────────────────────────────────────
+
+// Row positions on page 2 of the ImPACT Clinical Report (US Letter 612x792).
+// Y values are in standard PDF coordinates (origin at bottom-left).
+// Extracted from the content stream Tm operators of a v5.1.0 report.
+const NORM_ROWS = [
+  { key: 'pVERBAL', y: 537.12 },
+  { key: 'pVISUAL', y: 522.37 },
+  { key: 'pMSPEED', y: 507.62 },
+  { key: 'pREACTI', y: 492.87 },
+];
+
+const NORM_X = 220;
+const NORM_FONT_SIZE = 7;
+const NORM_COLOR = rgb(0.21, 0.25, 0.32);
+
+/**
+ * Overlay normative percentile values onto the composite score table
+ * on page 2 of an ImPACT Clinical Report PDF.
+ *
+ * @param {Buffer} pdfBuffer - Original PDF bytes
+ * @param {object} norms     - { pVERBAL, pVISUAL, pMSPEED, pREACTI }
+ * @returns {Buffer} Modified PDF bytes (or original if overlay fails)
+ */
+export async function overlayNormsOnPDF(pdfBuffer, norms) {
+  try {
+    const pdfDoc = await PDFDocument.load(pdfBuffer);
+    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const pages = pdfDoc.getPages();
+
+    if (pages.length < 2) {
+      logger.warn('PDF has fewer than 2 pages, skipping norm overlay');
+      return pdfBuffer;
+    }
+
+    const page = pages[1];
+
+    for (const row of NORM_ROWS) {
+      const value = norms[row.key];
+      if (!value) continue;
+
+      page.drawText(value, {
+        x: NORM_X,
+        y: row.y,
+        size: NORM_FONT_SIZE,
+        font,
+        color: NORM_COLOR,
+      });
+    }
+
+    const modifiedBytes = await pdfDoc.save();
+    logger.debug('Overlaid norms onto PDF');
+    return Buffer.from(modifiedBytes);
+  } catch (err) {
+    logger.warn('Failed to overlay norms on PDF, using original', { error: err.message });
+    return pdfBuffer;
+  }
 }

@@ -1,4 +1,4 @@
-import { fetchTests, downloadReportPDF, fetchReportNorms } from './impact-client.js';
+import { fetchTests, downloadReportPDF, fetchReportNorms, overlayNormsOnPDF } from './impact-client.js';
 import { findPatient, uploadDocument, loadTokens } from './drchrono-client.js';
 import { loadState, isProcessed, markProcessed } from './state.js';
 import logger from './logger.js';
@@ -122,7 +122,12 @@ export async function runSync() {
         } catch { /* use today */ }
       }
 
-      await uploadDocument(patient.id, doctorId, pdfBuffer, description, testDate);
+      // Overlay percentile norms onto the PDF if available
+      const finalPdf = norms
+        ? await overlayNormsOnPDF(pdfBuffer, norms)
+        : pdfBuffer;
+
+      await uploadDocument(patient.id, doctorId, finalPdf, description, testDate);
 
       // ── Mark as done ──
       markProcessed(state, test.testID);
