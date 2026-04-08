@@ -125,3 +125,42 @@ export async function downloadReportPDF(testID, recordTypeIdentifier) {
   logger.info(`Downloaded PDF for test ${testID} (${(pdfBuffer.length / 1024).toFixed(1)} KB)`);
   return pdfBuffer;
 }
+
+/**
+ * Fetch normative percentile data for a test.
+ * Uses GET /common/report with format=json and includeNorms=1.
+ *
+ * Returns an object like:
+ *   { pVERBAL: '<1%', pVISUAL: '10%', pMSPEED: '<1%', pREACTI: '63%' }
+ * or null if norms are unavailable.
+ */
+export async function fetchReportNorms(testID, recordTypeIdentifier) {
+  const params = {
+    token: USER_TOKEN,
+    testIDs: String(testID),
+    recordTypeIdentifier: recordTypeIdentifier || 'Sports',
+    format: 'json',
+    includeNorms: '1',
+  };
+
+  const signed = signParameters(params);
+  const url = BASE_URL + 'common/report?' + new URLSearchParams(signed).toString();
+
+  logger.debug('Fetching ImPACT report norms', { testID });
+
+  const response = await axios.get(url, {
+    headers: { Accept: 'application/json' },
+    timeout: 30000,
+  });
+
+  const record = response.data?.report?.records?.[0];
+  const norms = record?.norms || null;
+
+  if (norms) {
+    logger.info(`Fetched norms for test ${testID}`, norms);
+  } else {
+    logger.debug(`No norms available for test ${testID}`);
+  }
+
+  return norms;
+}

@@ -1,4 +1,4 @@
-import { fetchTests, downloadReportPDF } from './impact-client.js';
+import { fetchTests, downloadReportPDF, fetchReportNorms } from './impact-client.js';
 import { findPatient, uploadDocument, loadTokens } from './drchrono-client.js';
 import { loadState, isProcessed, markProcessed } from './state.js';
 import logger from './logger.js';
@@ -95,15 +95,24 @@ export async function runSync() {
         continue;
       }
 
-      // ── Step 2: Download the PDF from ImPACT ──
-      const pdfBuffer = await downloadReportPDF(
-        test.testID,
-        test.recordTypeIdentifier || 'Sports'
-      );
+      // ── Step 2: Download the PDF and fetch norms from ImPACT ──
+      const recType = test.recordTypeIdentifier || 'Sports';
+      const [pdfBuffer, norms] = await Promise.all([
+        downloadReportPDF(test.testID, recType),
+        fetchReportNorms(test.testID, recType).catch(() => null),
+      ]);
 
       // ── Step 3: Upload to DrChrono ──
       const doctorId = patient.doctor || process.env.DRCHRONO_DOCTOR_ID;
-      const description = `ImPACT ${test.testType || 'Test'} Report — ${test.userFirstName} ${test.userLastName}`;
+      let description = `ImPACT ${test.testType || 'Test'} Report — ${test.userFirstName} ${test.userLastName}`;
+      if (norms) {
+        const parts = [];
+        if (norms.pVERBAL) parts.push(`Verbal Memory: ${norms.pVERBAL}`);
+        if (norms.pVISUAL) parts.push(`Visual Memory: ${norms.pVISUAL}`);
+        if (norms.pMSPEED) parts.push(`Motor Speed: ${norms.pMSPEED}`);
+        if (norms.pREACTI) parts.push(`Reaction Time: ${norms.pREACTI}`);
+        if (parts.length) description += ` | Percentiles: ${parts.join(', ')}`;
+      }
 
       // Format the test date for DrChrono (YYYY-MM-DD)
       let testDate = now.toISOString().split('T')[0];
