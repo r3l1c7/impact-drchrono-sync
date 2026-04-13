@@ -2,7 +2,7 @@ import nodemailer from 'nodemailer';
 import logger from './logger.js';
 
 const GMAIL_EMAIL = process.env.GMAIL_EMAIL;
-const GMAIL_PASSWORD = process.env.GMAIL_PASSWORD;
+const GMAIL_PASSWORD = (process.env.GMAIL_PASSWORD || '').replace(/\s/g, '');
 const ALERT_TO = process.env.ALERT_EMAIL_TO;
 
 let transporter = null;
@@ -10,7 +10,9 @@ let transporter = null;
 function getTransporter() {
   if (!transporter && GMAIL_EMAIL && GMAIL_PASSWORD) {
     transporter = nodemailer.createTransport({
-      service: 'gmail',
+      host: 'smtp.gmail.com',
+      port: 587,
+      secure: false,
       auth: { user: GMAIL_EMAIL, pass: GMAIL_PASSWORD },
     });
   }
