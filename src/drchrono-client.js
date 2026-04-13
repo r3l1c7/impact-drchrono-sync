@@ -130,24 +130,52 @@ function firstNameCompatible(impactName, drchronoName) {
 }
 
 /**
+ * Check whether two last names are compatible for compound name matching.
+ * Returns true if one contains the other as a whole word.
+ * e.g. "Perez Varela" contains "Varela", "Varela" is in "Perez Varela".
+ */
+function lastNameCompatible(searchName, drchronoName) {
+  const a = (searchName || '').trim().toUpperCase();
+  const b = (drchronoName || '').trim().toUpperCase();
+  if (!a || !b) return false;
+  return a === b || b.includes(a) || a.includes(b);
+}
+
+/**
+ * Try to confirm a single candidate from a DOB search.
+ * Checks first name compatibility and returns the patient or null.
+ */
+function confirmCandidate(candidate, firstName, matchType) {
+  if (!firstNameCompatible(firstName, candidate.first_name)) {
+    logger.warn(`${matchType} rejected: first names not compatible ("${firstName}" vs "${candidate.first_name}")`);
+    return null;
+  }
+  logger.info(`Found patient ID: ${candidate.id} (${matchType}: "${candidate.first_name} ${candidate.last_name}" for "${firstName}")`);
+  return candidate;
+}
+
+/**
  * Search for a patient in DrChrono by name and DOB.
  *
  * Strategy:
- *   1. Exact match: first_name + last_name + DOB
- *   2. Fallback:    last_name + DOB only
- *      - Accept if exactly 1 result AND first name is a prefix match
- *      - Skip if 0 results, 2+ results, or name doesn't partially match
+ *   1. Exact match:     first_name + last_name + DOB
+ *   2. Last name + DOB: drop first_name, require 1 result with compatible first name
+ *   3. DOB only:        handle compound last names (e.g. "Varela" vs "Perez Varela")
+ *      - Search by DOB alone, filter results where last name contains the search term
+ *      - Accept only if exactly 1 candidate survives AND first name is compatible
  *
  * Returns the matching patient object, or null.
  */
 export async function findPatient(firstName, lastName, dob) {
   const formattedDOB = formatDOB(dob);
+  const trimmedFirst = (firstName || '').trim();
+  const trimmedLast = (lastName || '').trim();
 
   // ── Pass 1: exact first + last + DOB ──
-  const exactParams = { first_name: firstName, last_name: lastName };
+  const exactParams = { first_name: trimmedFirst, last_name: trimmedLast };
   if (formattedDOB) exactParams.date_of_birth = formattedDOB;
 
-  logger.debug('Searching DrChrono for patient', { lastName, dob: formattedDOB });
+  logger.debug('Searching DrChrono for patient', { lastName: trimmedLast, dob: formattedDOB });
 
   const exactResp = await drchronoRequest({
     method: 'GET',
@@ -166,47 +194,88 @@ export async function findPatient(firstName, lastName, dob) {
 
   if (exactResults.length > 1) {
     logger.warn(`Multiple patients matched — using first (ID: ${exactResults[0].id})`);
-    logger.debug(`Multi-match for: ${firstName} ${lastName}`);
+    logger.debug(`Multi-match for: ${trimmedFirst} ${trimmedLast}`);
     return exactResults[0];
   }
 
-  // ── Pass 2: fallback to last_name + DOB only ──
   if (!formattedDOB) {
     logger.warn(`No patient found in DrChrono for given name/DOB`);
-    logger.debug(`Unmatched patient: ${firstName} ${lastName} (DOB: ${dob})`);
+    logger.debug(`Unmatched patient: ${trimmedFirst} ${trimmedLast} (DOB: ${dob})`);
     return null;
   }
 
+  // ── Pass 2: last_name + DOB only (first name mismatch) ──
   logger.debug('Exact match failed, trying last_name + DOB fallback');
 
   const fallbackResp = await drchronoRequest({
     method: 'GET',
     url: '/api/patients',
-    params: { last_name: lastName, date_of_birth: formattedDOB },
+    params: { last_name: trimmedLast, date_of_birth: formattedDOB },
   });
 
   const fallbackResults = fallbackResp.data.results || [];
 
-  if (fallbackResults.length === 0) {
-    logger.warn(`No patient found in DrChrono for given name/DOB`);
-    logger.debug(`Unmatched patient: ${firstName} ${lastName} (DOB: ${dob})`);
-    return null;
+  if (fallbackResults.length === 1) {
+    const match = confirmCandidate(fallbackResults[0], trimmedFirst, 'fuzzy match');
+    if (match) return match;
+  } else if (fallbackResults.length > 1) {
+    logger.warn(`Pass 2 returned ${fallbackResults.length} patients for same last name + DOB — skipping (ambiguous)`);
   }
 
-  if (fallbackResults.length > 1) {
-    logger.warn(`Fuzzy search returned ${fallbackResults.length} patients for same last name + DOB — skipping (ambiguous)`);
-    return null;
+  // ── Pass 3: DOB only — compound last name handling ──
+  // e.g. Sway has "Varela" but DrChrono has "Perez Varela"
+  logger.debug('Trying DOB-only search for compound last name match');
+
+  const dobResp = await drchronoRequest({
+    method: 'GET',
+    url: '/api/patients',
+    params: { date_of_birth: formattedDOB },
+  });
+
+  const dobResults = dobResp.data.results || [];
+  const lastNameCandidates = dobResults.filter(p =>
+    lastNameCompatible(trimmedLast, p.last_name)
+  );
+
+  if (lastNameCandidates.length === 1) {
+    const match = confirmCandidate(lastNameCandidates[0], trimmedFirst, 'compound name match');
+    if (match) return match;
+  } else if (lastNameCandidates.length > 1) {
+    logger.warn(`Pass 3 returned ${lastNameCandidates.length} DOB+last-name candidates — skipping (ambiguous)`);
   }
 
-  const candidate = fallbackResults[0];
+  logger.warn(`No patient found in DrChrono for given name/DOB`);
+  logger.debug(`Unmatched patient: ${trimmedFirst} ${trimmedLast} (DOB: ${dob})`);
+  return null;
+}
 
-  if (!firstNameCompatible(firstName, candidate.first_name)) {
-    logger.warn(`Fuzzy match rejected: first names not compatible ("${firstName}" vs "${candidate.first_name}")`);
-    return null;
+// ─── Document Duplicate Check ───────────────────────────────────
+
+/**
+ * Check whether a document with a given test ID tag already exists
+ * on a patient's chart. Used as a server-side safety net so we never
+ * upload the same report twice, even if the local state file is lost.
+ *
+ * @param {number} patientId - DrChrono patient ID
+ * @param {string} testIdTag - Tag to search for, e.g. "[impact:26762488]"
+ * @param {string} [sinceDate] - ISO date string to limit the search window
+ * @returns {boolean} true if a matching document already exists
+ */
+export async function documentExists(patientId, testIdTag, sinceDate) {
+  const params = { patient: patientId };
+  if (sinceDate) {
+    // DrChrono rejects timezone suffixes — strip trailing Z or offset
+    params.since = sinceDate.replace(/[Z+].*$/, '');
   }
 
-  logger.info(`Found patient ID: ${candidate.id} (fuzzy match: "${candidate.first_name}" ≈ "${firstName}")`);
-  return candidate;
+  const resp = await drchronoRequest({
+    method: 'GET',
+    url: '/api/documents',
+    params,
+  });
+
+  const docs = resp.data.results || [];
+  return docs.some(d => (d.description || '').includes(testIdTag));
 }
 
 // ─── Document Upload ───────────────────────────────────────────
@@ -214,32 +283,29 @@ export async function findPatient(firstName, lastName, dob) {
 /**
  * Upload a PDF to a patient's chart in DrChrono.
  *
- * THIS IS THE FIX for your Zapier version:
- * - Uses the `form-data` library to build proper multipart/form-data
- * - Sends the PDF as actual binary (Buffer), NOT base64-encoded text
- * - DrChrono expects `document` field to be a real file upload
- *
- * @param {number} patientId  - DrChrono patient ID
- * @param {number} doctorId   - DrChrono doctor ID
- * @param {Buffer} pdfBuffer  - Raw PDF bytes
+ * @param {number} patientId   - DrChrono patient ID
+ * @param {number} doctorId    - DrChrono doctor ID
+ * @param {Buffer} pdfBuffer   - Raw PDF bytes
  * @param {string} description - Document description
- * @param {string} testDate   - Date string for the document
+ * @param {string} testDate    - Date string for the document
+ * @param {object} [opts]
+ * @param {string} [opts.filename='ImPACT_Report.pdf']
+ * @param {string[]} [opts.metatags=['ImPACT','Concussion']]
  * @returns {object} Upload result
  */
-export async function uploadDocument(patientId, doctorId, pdfBuffer, description, testDate) {
-  // Build a real multipart form with the form-data library
+export async function uploadDocument(patientId, doctorId, pdfBuffer, description, testDate, {
+  filename = 'ImPACT_Report.pdf',
+  metatags = ['ImPACT', 'Concussion'],
+} = {}) {
   const form = new FormData();
   form.append('doctor', String(doctorId));
   form.append('patient', String(patientId));
   form.append('description', description);
   form.append('date', testDate || new Date().toISOString().split('T')[0]);
-  form.append('metatags', JSON.stringify(['ImPACT', 'Concussion']));
+  form.append('metatags', JSON.stringify(metatags));
 
-  // THIS is the key difference from your Zapier code:
-  // Append the PDF as a real binary buffer with proper filename and MIME type.
-  // The form-data library handles the multipart boundary and encoding correctly.
   form.append('document', pdfBuffer, {
-    filename: `ImPACT_Report.pdf`,
+    filename,
     contentType: 'application/pdf',
   });
 

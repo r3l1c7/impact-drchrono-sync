@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import cron from 'node-cron';
 import { runSync } from './sync.js';
+import { runSwaySync } from './sway-sync.js';
 import logger from './logger.js';
 
 // ─── Validate required env vars ────────────────────────────────
@@ -23,21 +24,29 @@ if (missing.length) {
   process.exit(1);
 }
 
+const swayEnabled = !!process.env.SWAY_API_KEY;
+
 // ─── Schedule ──────────────────────────────────────────────────
 
 const schedule = process.env.SYNC_CRON || '*/15 * * * *';
 
-logger.info('ImPACT → DrChrono sync service starting');
+logger.info('Test → DrChrono sync service starting');
+logger.info(`Providers: ImPACT${swayEnabled ? ', Sway' : ''}`);
 logger.info(`Schedule: ${schedule}`);
 logger.info(`Lookback: ${process.env.LOOKBACK_HOURS || 24} hours`);
 
+async function runAllSyncs() {
+  await runSync().catch(err => logger.error('ImPACT sync failed', { error: err.message }));
+  if (swayEnabled) {
+    await runSwaySync().catch(err => logger.error('Sway sync failed', { error: err.message }));
+  }
+}
+
 // Run once immediately on startup
-runSync().catch(err => logger.error('Initial sync failed', { error: err.message }));
+runAllSyncs();
 
 // Then run on schedule
-cron.schedule(schedule, () => {
-  runSync().catch(err => logger.error('Scheduled sync failed', { error: err.message }));
-});
+cron.schedule(schedule, () => { runAllSyncs(); });
 
 // ─── Graceful shutdown ─────────────────────────────────────────
 

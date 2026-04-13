@@ -1,6 +1,7 @@
 import { fetchTests, downloadReportPDF, fetchReportNorms, overlayNormsOnPDF } from './impact-client.js';
-import { findPatient, uploadDocument, loadTokens } from './drchrono-client.js';
+import { findPatient, uploadDocument, documentExists, loadTokens } from './drchrono-client.js';
 import { loadState, isProcessed, markProcessed } from './state.js';
+import { sendUnmatchedAlert } from './notify.js';
 import logger from './logger.js';
 
 // ─── Hard cutoff: ignore all tests before this date ────────────
@@ -89,22 +90,40 @@ export async function runSync() {
       if (!patient) {
         logger.warn(`SKIPPED: ${labelSafe} — no matching patient in DrChrono`);
         logger.debug(`Skipped patient: ${labelFull}`);
-        // Don't mark as processed — we'll retry next cycle in case
-        // the patient gets added to DrChrono later
+        await sendUnmatchedAlert({
+          source: 'ImPACT',
+          firstName: test.userFirstName,
+          lastName: test.userLastName,
+          dob: test.userDateOfBirth,
+          testId: test.testID,
+          testDate: test.currentDate,
+          testType: test.testType,
+        });
         failCount++;
         continue;
       }
 
-      // ── Step 2: Download the PDF and fetch norms from ImPACT ──
+      // ── Step 2: Server-side duplicate check ──
+      const testIdTag = `[impact:${test.testID}]`;
+      const alreadyUploaded = await documentExists(
+        patient.id, testIdTag, effectiveStart.toISOString()
+      );
+      if (alreadyUploaded) {
+        logger.warn(`SKIPPED: ${labelSafe} — document already exists on patient ${patient.id}`);
+        markProcessed(state, test.testID);
+        continue;
+      }
+
+      // ── Step 3: Download the PDF and fetch norms from ImPACT ──
       const recType = test.recordTypeIdentifier || 'Sports';
       const [pdfBuffer, norms] = await Promise.all([
         downloadReportPDF(test.testID, recType),
         fetchReportNorms(test.testID, recType).catch(() => null),
       ]);
 
-      // ── Step 3: Upload to DrChrono ──
+      // ── Step 4: Upload to DrChrono ──
       const doctorId = patient.doctor || process.env.DRCHRONO_DOCTOR_ID;
-      let description = `ImPACT ${test.testType || 'Test'} Report — ${test.userFirstName} ${test.userLastName}`;
+      let description = `ImPACT ${test.testType || 'Test'} Report ${testIdTag} — ${test.userFirstName} ${test.userLastName}`;
       if (norms) {
         const parts = [];
         if (norms.pVERBAL) parts.push(`Verbal Memory: ${norms.pVERBAL}`);
@@ -114,7 +133,6 @@ export async function runSync() {
         if (parts.length) description += ` | Percentiles: ${parts.join(', ')}`;
       }
 
-      // Format the test date for DrChrono (YYYY-MM-DD)
       let testDate = now.toISOString().split('T')[0];
       if (test.currentDate) {
         try {
@@ -122,7 +140,6 @@ export async function runSync() {
         } catch { /* use today */ }
       }
 
-      // Overlay percentile norms onto the PDF if available
       const finalPdf = norms
         ? await overlayNormsOnPDF(pdfBuffer, norms)
         : pdfBuffer;
